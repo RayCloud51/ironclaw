@@ -89,6 +89,9 @@ pub async fn setup_wasm_channels(
         settings_store.clone(),
         config.owner_id.clone(),
     );
+    if let Some(db) = database {
+        loader = loader.with_database(Arc::clone(db));
+    }
     if let Some(secrets) = secrets_store {
         loader = loader.with_secrets_store(Arc::clone(secrets));
     }
@@ -177,7 +180,7 @@ pub async fn setup_wasm_channels(
 /// Process a single loaded WASM channel: retrieve secrets, inject config,
 /// register with the router, and set up signing keys and credentials.
 async fn register_channel(
-    loaded: LoadedChannel,
+    mut loaded: LoadedChannel,
     config: &Config,
     secrets_store: &Option<Arc<dyn SecretsStore + Send + Sync>>,
     settings_store: Option<&Arc<dyn crate::db::SettingsStore>>,
@@ -220,6 +223,19 @@ async fn register_channel(
         methods: vec!["POST".to_string()],
         require_secret: host_webhook_secret.is_some(),
     }];
+
+    // Resolve HOMESERVER_HOST_PLACEHOLDER in Matrix channel capabilities.
+    // The homeserver URL is user-configured and stored as a secret during onboard,
+    // so we need to resolve it at runtime to update the HTTP allowlist and
+    // credential host_patterns.
+    if channel_name == "matrix" {
+        resolve_matrix_homeserver_host(
+            &mut loaded.channel,
+            secrets_store,
+            &config.owner_id,
+        )
+        .await;
+    }
 
     let channel_arc = Arc::new(loaded.channel.with_owner_actor_id(owner_actor_id.clone()));
 
@@ -463,6 +479,91 @@ pub async fn inject_channel_credentials(
     Ok(count)
 }
 
+/// Placeholder used in `matrix.capabilities.json` for the homeserver hostname.
+/// Resolved at channel setup time once the `matrix_homeserver_url` secret is available.
+const HOMESERVER_HOST_PLACEHOLDER: &str = "HOMESERVER_HOST_PLACEHOLDER";
+
+/// Resolve `HOMESERVER_HOST_PLACEHOLDER` in the Matrix channel's capabilities.
+///
+/// Reads the `matrix_homeserver_url` secret, extracts its hostname, and replaces
+/// the placeholder in:
+/// - `http.allowlist[].host`
+/// - `http.credentials[].host_patterns[]`
+async fn resolve_matrix_homeserver_host(
+    channel: &mut WasmChannel,
+    secrets_store: &Option<Arc<dyn SecretsStore + Send + Sync>>,
+    owner_id: &str,
+) {
+    let Some(secrets) = secrets_store else {
+        return;
+    };
+
+    // Try the secrets store first, then fall back to the environment variable.
+    let homeserver_url = match secrets.get_decrypted(owner_id, "matrix_homeserver_url").await {
+        Ok(decrypted) => decrypted.expose().to_string(),
+        Err(_) => match std::env::var("MATRIX_HOMESERVER_URL") {
+            Ok(val) if !val.is_empty() => val,
+            _ => {
+                tracing::warn!(
+                    "Cannot resolve Matrix homeserver host: matrix_homeserver_url secret not found"
+                );
+                return;
+            }
+        },
+    };
+
+    // Extract the hostname from the URL (e.g., "https://matrix.o3o.icu" -> "matrix.o3o.icu").
+    let host = match url::Url::parse(&homeserver_url) {
+        Ok(parsed) => match parsed.host_str() {
+            Some(h) => h.to_string(),
+            None => {
+                tracing::warn!(
+                    homeserver_url = %homeserver_url,
+                    "Matrix homeserver URL has no host component"
+                );
+                return;
+            }
+        },
+        Err(_) => {
+            // Fall back: strip scheme prefix and trailing slashes/paths.
+            homeserver_url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(&homeserver_url)
+                .split(':')
+                .next()
+                .unwrap_or(&homeserver_url)
+                .to_string()
+        }
+    };
+
+    tracing::info!(
+        host = %host,
+        "Resolving HOMESERVER_HOST_PLACEHOLDER in Matrix channel capabilities"
+    );
+
+    let caps = channel.capabilities_mut();
+    if let Some(ref mut http) = caps.tool_capabilities.http {
+        // Replace in allowlist hosts.
+        for endpoint in &mut http.allowlist {
+            if endpoint.host == HOMESERVER_HOST_PLACEHOLDER {
+                endpoint.host = host.clone();
+            }
+        }
+
+        // Replace in credential host_patterns.
+        for cred in http.credentials.values_mut() {
+            for pattern in &mut cred.host_patterns {
+                if pattern == HOMESERVER_HOST_PLACEHOLDER {
+                    *pattern = host.clone();
+                }
+            }
+        }
+    }
+}
+
 /// Inject channel-specific secrets into the config JSON.
 ///
 /// Some channels (e.g., Feishu) need raw credential values in their config
@@ -486,6 +587,11 @@ async fn inject_channel_secrets_into_config(
             ("app_id", "feishu_app_id"),
             ("app_secret", "feishu_app_secret"),
             ("verification_token", "feishu_verification_token"),
+        ],
+        "matrix" => &[
+            ("homeserver_url", "matrix_homeserver_url"),
+            ("user_id", "matrix_user_id"),
+            ("device_id", "matrix_device_id"),
         ],
         _ => return,
     };

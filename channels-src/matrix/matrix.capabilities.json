@@ -1,0 +1,92 @@
+{
+  "version": "0.1.0",
+  "wit_version": "0.3.0",
+  "type": "channel",
+  "name": "matrix",
+  "description": "Matrix messaging channel with E2EE support via Olm/Megolm",
+  "auth": {
+    "secret_name": "matrix_access_token",
+    "display_name": "Matrix",
+    "instructions": "Get your access token from Element: Settings > Help & About > Access Token. Or use a bot account token from your homeserver admin.",
+    "token_hint": "Looks like syt_... or MDAxN...",
+    "env_var": "MATRIX_ACCESS_TOKEN"
+  },
+  "setup": {
+    "required_secrets": [
+      {
+        "name": "matrix_access_token",
+        "prompt": "Matrix access token (from Element > Settings > Help & About > Access Token, or use password login)",
+        "optional": false
+      },
+      {
+        "name": "matrix_homeserver_url",
+        "prompt": "Matrix homeserver URL (e.g. https://matrix.example.com)",
+        "optional": false
+      }
+    ],
+    "optional_secrets": [
+      {
+        "name": "matrix_user_id",
+        "prompt": "Matrix user ID (e.g. @bot:example.com). Leave empty to auto-detect from /whoami",
+        "optional": true
+      },
+      {
+        "name": "matrix_device_id",
+        "prompt": "Device ID for E2EE (leave empty to auto-generate)",
+        "optional": true
+      },
+      {
+        "name": "matrix_pickle_key",
+        "prompt": "E2EE pickle key (leave empty to auto-generate)",
+        "optional": true,
+        "auto_generate": { "length": 64 }
+      }
+    ]
+  },
+  "capabilities": {
+    "http": {
+      "allowlist": [
+        { "host": "HOMESERVER_HOST_PLACEHOLDER", "path_prefix": "/_matrix/" }
+      ],
+      "credentials": {
+        "matrix_token": {
+          "secret_name": "matrix_access_token",
+          "location": { "type": "bearer" },
+          "host_patterns": ["HOMESERVER_HOST_PLACEHOLDER"]
+        }
+      },
+      "rate_limit": {
+        "requests_per_minute": 120,
+        "requests_per_hour": 3000
+      }
+    },
+    "secrets": {
+      "allowed_names": ["matrix_*"]
+    },
+    "channel": {
+      "allowed_paths": ["/webhook/matrix"],
+      "allow_polling": true,
+      "min_poll_interval_ms": 30000,
+      "workspace_prefix": "channels/matrix/",
+      "emit_rate_limit": {
+        "messages_per_minute": 60,
+        "messages_per_hour": 2000
+      },
+      "webhook": {
+        "secret_header": "X-Matrix-Webhook-Secret",
+        "secret_name": "matrix_webhook_secret"
+      }
+    }
+  },
+  "config": {
+    "homeserver_url": "",
+    "user_id": null,
+    "device_id": null,
+    "dm_policy": "pairing",
+    "allow_from": [],
+    "respond_to_all_room_messages": false,
+    "allowed_room_ids": [],
+    "sync_timeout_ms": 30000,
+    "enable_e2ee": false
+  }
+}
