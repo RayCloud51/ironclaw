@@ -502,40 +502,148 @@ impl ChannelHostState {
     }
 }
 
-/// In-memory workspace store for WASM channels.
+/// Workspace store for WASM channels with database and disk persistence.
 ///
-/// Persists workspace writes across callback invocations within a single
-/// channel lifetime. This allows WASM channels to maintain state (e.g.,
-/// Telegram polling offsets) between poll ticks without requiring a
-/// full database-backed workspace.
+/// Writes are kept in memory for fast access and also persisted to the
+/// database (or disk as fallback) so that state (e.g., crypto accounts,
+/// polling offsets) survives process restarts. Reads check the in-memory
+/// cache first, then fall back to the database, then to disk.
 ///
 /// Uses `std::sync::RwLock` (not tokio) because WASM execution runs
-/// inside `spawn_blocking`.
+/// inside `spawn_blocking`. Database calls use a dedicated single-threaded
+/// tokio runtime for sync-to-async bridging.
 pub struct ChannelWorkspaceStore {
+    /// In-memory cache of workspace data (keyed by the full prefixed path).
     data: std::sync::RwLock<std::collections::HashMap<String, String>>,
+    /// Channel identifier for DB queries (e.g., "matrix").
+    channel_id: String,
+    /// Prefix the host layer prepends to guest paths (e.g., "channels/matrix/").
+    /// Stripped before using paths as DB keys since `channel_id` already scopes.
+    db_key_prefix: String,
+    /// Database backend for persistent storage.
+    db: Option<std::sync::Arc<dyn crate::db::ChannelWorkspaceDbStore>>,
+    /// Dedicated tokio runtime for blocking async DB calls from sync context.
+    db_runtime: Option<tokio::runtime::Runtime>,
+    /// Legacy disk directory for fallback during migration.
+    disk_dir: Option<std::path::PathBuf>,
 }
 
 impl ChannelWorkspaceStore {
-    /// Create a new empty workspace store.
+    /// Create a new workspace store without persistence (for tests).
     pub fn new() -> Self {
         Self {
             data: std::sync::RwLock::new(std::collections::HashMap::new()),
+            channel_id: String::new(),
+            db_key_prefix: String::new(),
+            db: None,
+            db_runtime: None,
+            disk_dir: None,
         }
     }
 
+    /// Create a workspace store backed by the database.
+    pub fn with_db(
+        channel_id: String,
+        db: std::sync::Arc<dyn crate::db::ChannelWorkspaceDbStore>,
+    ) -> Self {
+        let db_key_prefix = format!("channels/{}/", channel_id);
+        let db_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok();
+        Self {
+            data: std::sync::RwLock::new(std::collections::HashMap::new()),
+            db_key_prefix,
+            channel_id,
+            db: Some(db),
+            db_runtime,
+            disk_dir: None,
+        }
+    }
+
+    /// Create a workspace store backed by the given directory (legacy fallback).
+    ///
+    /// The directory is created if it does not exist. Any existing files
+    /// under the directory are NOT eagerly loaded — they are read on demand
+    /// and then cached in memory.
+    pub fn with_disk(dir: std::path::PathBuf) -> Self {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "Failed to create channel workspace directory"
+            );
+        }
+        Self {
+            data: std::sync::RwLock::new(std::collections::HashMap::new()),
+            channel_id: String::new(),
+            db_key_prefix: String::new(),
+            db: None,
+            db_runtime: None,
+            disk_dir: Some(dir),
+        }
+    }
+
+    /// Strip the host-layer prefix from a path to get the raw DB key.
+    ///
+    /// The host layer prepends `channels/{channel_id}/` to every guest path,
+    /// but the DB already scopes by `channel_id`, so the prefix is redundant.
+    /// Example: "channels/matrix/crypto/account.json" → "crypto/account.json"
+    fn strip_prefix<'a>(&self, path: &'a str) -> &'a str {
+        path.strip_prefix(&self.db_key_prefix).unwrap_or(path)
+    }
+
     /// Commit pending writes from a callback execution into the store.
+    ///
+    /// Writes are applied to the in-memory cache, database, and disk (if configured).
     pub fn commit_writes(&self, writes: &[PendingWorkspaceWrite]) {
         if writes.is_empty() {
             return;
         }
         if let Ok(mut data) = self.data.write() {
             for write in writes {
-                tracing::debug!(
-                    path = %write.path,
-                    content_len = write.content.len(),
-                    "Committing workspace write to channel store"
-                );
                 data.insert(write.path.clone(), write.content.clone());
+
+                // Persist to database (use raw key without host prefix)
+                if let (Some(db), Some(rt)) = (&self.db, &self.db_runtime) {
+                    let db = std::sync::Arc::clone(db);
+                    let channel_id = self.channel_id.clone();
+                    let db_key = self.strip_prefix(&write.path).to_string();
+                    let content = write.content.clone();
+                    if let Err(e) = rt.block_on(async {
+                        db.channel_workspace_write(&channel_id, &db_key, &content)
+                            .await
+                    }) {
+                        tracing::warn!(
+                            channel = %self.channel_id,
+                            path = %write.path,
+                            error = %e,
+                            "Failed to persist workspace write to database"
+                        );
+                    }
+                }
+
+                // Legacy: also write to disk if disk_dir is set
+                if let Some(ref base) = self.disk_dir {
+                    let file_path = base.join(&write.path);
+                    if let Some(parent) = file_path.parent()
+                        && let Err(e) = std::fs::create_dir_all(parent)
+                    {
+                        tracing::warn!(
+                            path = %file_path.display(),
+                            error = %e,
+                            "Failed to create workspace directory"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = std::fs::write(&file_path, &write.content) {
+                        tracing::warn!(
+                            path = %file_path.display(),
+                            error = %e,
+                            "Failed to persist workspace write to disk"
+                        );
+                    }
+                }
             }
         }
     }
@@ -602,7 +710,46 @@ impl ChannelWorkspaceStore {
 
 impl crate::tools::wasm::WorkspaceReader for ChannelWorkspaceStore {
     fn read(&self, path: &str) -> Option<String> {
-        self.data.read().ok()?.get(path).cloned()
+        // 1. Check in-memory cache
+        if let Some(val) = self.data.read().ok()?.get(path).cloned() {
+            return Some(val);
+        }
+
+        // 2. Try database (use raw key without host prefix)
+        if let (Some(db), Some(rt)) = (&self.db, &self.db_runtime) {
+            let db_key = self.strip_prefix(path);
+            match rt.block_on(async {
+                db.channel_workspace_read(&self.channel_id, db_key).await
+            }) {
+                Ok(Some(content)) => {
+                    if let Ok(mut data) = self.data.write() {
+                        data.insert(path.to_string(), content.clone());
+                    }
+                    return Some(content);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        channel = %self.channel_id,
+                        path = %path,
+                        error = %e,
+                        "Failed to read workspace from database"
+                    );
+                }
+            }
+        }
+
+        // 3. Fall back to disk (legacy)
+        let base = self.disk_dir.as_ref()?;
+        let file_path = base.join(path);
+        let content = std::fs::read_to_string(&file_path).ok()?;
+
+        // Cache the value in memory for subsequent reads
+        if let Ok(mut data) = self.data.write() {
+            data.insert(path.to_string(), content.clone());
+        }
+
+        Some(content)
     }
 }
 
@@ -646,7 +793,6 @@ impl RateWindow {
     }
 }
 
-#[allow(dead_code)]
 impl ChannelEmitRateLimiter {
     /// Create a new rate limiter with the given config.
     pub fn new(config: EmitRateLimitConfig) -> Self {
@@ -1215,5 +1361,101 @@ mod tests {
 
         let messages = state.take_emitted_messages();
         assert_eq!(messages[0].attachments.len(), 2);
+    }
+
+    /// Regression test: ChannelWorkspaceStore::with_db persists writes to the
+    /// database and reads them back, surviving a cache clear (simulating restart).
+    ///
+    /// Paths arrive at the store with the host-layer prefix (e.g.,
+    /// "channels/matrix/crypto/account.json") because ChannelHostState::workspace_write
+    /// calls validate_workspace_path() which prepends the prefix. The store must
+    /// strip that prefix before using it as a DB key, since channel_id already
+    /// scopes the data.
+    #[cfg(feature = "libsql")]
+    #[test]
+    fn test_channel_workspace_store_db_round_trip() {
+        use crate::channels::wasm::host::{ChannelWorkspaceStore, PendingWorkspaceWrite};
+        use crate::db::libsql::LibSqlBackend;
+        use crate::db::Database;
+        use crate::tools::wasm::WorkspaceReader;
+        use std::sync::Arc;
+
+        // Use a temp file so connections share state (in-memory DBs are
+        // connection-local in libSQL). ChannelWorkspaceStore::with_db creates
+        // its own current_thread runtime internally, so we set up outside tokio.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_workspace.db");
+        let setup_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let backend = setup_rt.block_on(async {
+            let b = LibSqlBackend::new_local(&db_path).await.unwrap();
+            b.run_migrations().await.unwrap();
+            b
+        });
+        let db: Arc<dyn crate::db::ChannelWorkspaceDbStore> = Arc::new(backend);
+
+        // Paths arrive WITH the host prefix (as ChannelHostState prepends it).
+        let store = ChannelWorkspaceStore::with_db("matrix".to_string(), Arc::clone(&db));
+        let writes = vec![
+            PendingWorkspaceWrite {
+                path: "channels/matrix/crypto/pickle_key".to_string(),
+                content: "deadbeef".to_string(),
+            },
+            PendingWorkspaceWrite {
+                path: "channels/matrix/sync/next_batch".to_string(),
+                content: "s12345_67890".to_string(),
+            },
+        ];
+        store.commit_writes(&writes);
+
+        // Read from cache (same store, prefixed paths)
+        assert_eq!(
+            store.read("channels/matrix/crypto/pickle_key"),
+            Some("deadbeef".to_string())
+        );
+        assert_eq!(
+            store.read("channels/matrix/sync/next_batch"),
+            Some("s12345_67890".to_string())
+        );
+
+        // Verify DB stores with STRIPPED key (no prefix redundancy)
+        let val = setup_rt.block_on(async {
+            db.channel_workspace_read("matrix", "crypto/pickle_key").await
+        });
+        assert_eq!(val.unwrap(), Some("deadbeef".to_string()));
+
+        // Create a fresh store (simulates restart — empty cache, same DB)
+        drop(setup_rt);
+        let store2 = ChannelWorkspaceStore::with_db("matrix".to_string(), Arc::clone(&db));
+
+        // Should read from DB via stripped key, not cache
+        assert_eq!(
+            store2.read("channels/matrix/crypto/pickle_key"),
+            Some("deadbeef".to_string())
+        );
+        assert_eq!(
+            store2.read("channels/matrix/sync/next_batch"),
+            Some("s12345_67890".to_string())
+        );
+
+        // Non-existent key returns None
+        assert!(store2.read("channels/matrix/no/such/key").is_none());
+
+        // Overwrite and verify
+        let overwrite = vec![PendingWorkspaceWrite {
+            path: "channels/matrix/sync/next_batch".to_string(),
+            content: "s99999_00000".to_string(),
+        }];
+        store2.commit_writes(&overwrite);
+        assert_eq!(
+            store2.read("channels/matrix/sync/next_batch"),
+            Some("s99999_00000".to_string())
+        );
+
+        // Different channel_id should not see the data
+        let store3 = ChannelWorkspaceStore::with_db("telegram".to_string(), Arc::clone(&db));
+        assert!(store3.read("channels/telegram/crypto/pickle_key").is_none());
     }
 }

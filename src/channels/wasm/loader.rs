@@ -27,6 +27,7 @@ pub struct WasmChannelLoader {
     pairing_store: Arc<PairingStore>,
     settings_store: Option<Arc<dyn SettingsStore>>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    database: Option<Arc<dyn crate::db::Database>>,
     owner_scope_id: String,
 }
 
@@ -43,6 +44,7 @@ impl WasmChannelLoader {
             pairing_store,
             settings_store,
             secrets_store: None,
+            database: None,
             owner_scope_id: owner_scope_id.into(),
         }
     }
@@ -50,6 +52,12 @@ impl WasmChannelLoader {
     /// Set the secrets store for host-based credential injection in WASM channels.
     pub fn with_secrets_store(mut self, store: Arc<dyn SecretsStore + Send + Sync>) -> Self {
         self.secrets_store = Some(store);
+        self
+    }
+
+    /// Set the database for persistent workspace storage.
+    pub fn with_database(mut self, db: Arc<dyn crate::db::Database>) -> Self {
+        self.database = Some(db);
         self
     }
 
@@ -156,6 +164,7 @@ impl WasmChannelLoader {
             config_json,
             self.pairing_store.clone(),
             self.settings_store.clone(),
+            self.database.clone(),
         );
         if let Some(ref secrets) = self.secrets_store {
             channel = channel.with_secrets_store(Arc::clone(secrets));

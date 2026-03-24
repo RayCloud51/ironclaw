@@ -683,6 +683,7 @@ mod tests {
             "{}".to_string(),
             Arc::new(PairingStore::new_noop()),
             None,
+            None,
         ))
     }
 

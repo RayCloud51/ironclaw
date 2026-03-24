@@ -111,6 +111,23 @@ interface channel-host {
     /// - Actual credentials are injected by host during HTTP requests
     secret-exists: func(name: string) -> bool;
 
+    /// Encrypt data using the channel's encryption key from the secrets store.
+    ///
+    /// Security:
+    /// - The encryption key never enters WASM memory
+    /// - Uses AES-256-GCM with a random 12-byte nonce per call
+    /// - Returns nonce || ciphertext || authentication tag
+    /// - Returns Err if no encryption key is configured for this channel
+    secure-encrypt: func(plaintext: list<u8>) -> result<list<u8>, string>;
+
+    /// Decrypt data that was previously encrypted with secure-encrypt.
+    ///
+    /// Security:
+    /// - The encryption key never enters WASM memory
+    /// - Validates the GCM authentication tag (tamper detection)
+    /// - Returns Err if decryption fails or no key is configured
+    secure-decrypt: func(ciphertext: list<u8>) -> result<list<u8>, string>;
+
     // ==================== Channel-Specific Capabilities ====================
 
     /// A file or media attachment on an inbound message (channel → agent).

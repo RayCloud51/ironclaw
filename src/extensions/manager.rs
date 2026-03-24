@@ -5423,13 +5423,16 @@ impl ExtensionManager {
         } else {
             let settings_store: Option<Arc<dyn crate::db::SettingsStore>> =
                 self.store.as_ref().map(|db| Arc::clone(db) as _);
-            let loader = WasmChannelLoader::new(
+            let mut loader = WasmChannelLoader::new(
                 Arc::clone(&channel_runtime),
                 Arc::clone(&pairing_store),
                 settings_store,
                 self.user_id.clone(),
             )
             .with_secrets_store(Arc::clone(&self.secrets));
+            if let Some(ref db) = self.store {
+                loader = loader.with_database(Arc::clone(db));
+            }
             loader
                 .load_from_files(name, &wasm_path, cap_path_option)
                 .await
@@ -5440,13 +5443,16 @@ impl ExtensionManager {
         let loaded = {
             let settings_store: Option<Arc<dyn crate::db::SettingsStore>> =
                 self.store.as_ref().map(|db| Arc::clone(db) as _);
-            let loader = WasmChannelLoader::new(
+            let mut loader = WasmChannelLoader::new(
                 Arc::clone(&channel_runtime),
                 Arc::clone(&pairing_store),
                 settings_store,
                 self.user_id.clone(),
             )
             .with_secrets_store(Arc::clone(&self.secrets));
+            if let Some(ref db) = self.store {
+                loader = loader.with_database(Arc::clone(db));
+            }
             loader
                 .load_from_files(name, &wasm_path, cap_path_option)
                 .await
@@ -9121,6 +9127,7 @@ mod tests {
                 "default",
                 "{}".to_string(),
                 pairing_store,
+                None,
                 None,
             ),
             capabilities_file: None,

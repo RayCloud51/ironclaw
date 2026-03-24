@@ -47,6 +47,7 @@ fn create_test_channel(
         "{}".to_string(),
         Arc::new(PairingStore::new_noop()),
         None,
+        None,
     )
 }
 

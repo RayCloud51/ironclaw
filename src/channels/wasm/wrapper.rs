@@ -113,6 +113,9 @@ struct ChannelStoreData {
     host_credentials: Vec<ResolvedHostCredential>,
     /// Pairing store for DM pairing (guest access control).
     pairing_store: Arc<PairingStore>,
+    /// Pre-resolved encryption key for secure-encrypt/secure-decrypt host functions.
+    /// Derived from `{channel_name}_pickle_key` in the secrets store.
+    encryption_key: Option<[u8; 32]>,
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
@@ -126,6 +129,7 @@ impl ChannelStoreData {
         credentials: HashMap<String, String>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        encryption_key: Option<[u8; 32]>,
     ) -> Self {
         // Create a minimal WASI context (no filesystem, no env vars for security)
         let wasi = WasiCtxBuilder::new().build();
@@ -138,6 +142,7 @@ impl ChannelStoreData {
             credentials,
             host_credentials,
             pairing_store,
+            encryption_key,
             http_runtime: None,
         }
     }
@@ -275,6 +280,73 @@ impl WasiView for ChannelStoreData {
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.table
     }
+}
+
+// ==================== Host-side encryption for WASM guests ====================
+
+/// Encrypt plaintext with AES-256-GCM. Returns `[12-byte nonce][ciphertext][16-byte tag]`.
+fn host_secure_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, AeadCore, OsRng}};
+
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Cipher init failed: {}", e))?;
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| format!("Encryption failed: {}", e))?;
+
+    let mut result = Vec::with_capacity(12 + ciphertext.len());
+    result.extend_from_slice(&nonce);
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+/// Decrypt data produced by `host_secure_encrypt`. Validates the GCM auth tag.
+fn host_secure_decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+
+    if data.len() < 28 {
+        return Err("Ciphertext too short (need at least nonce + tag)".to_string());
+    }
+
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Cipher init failed: {}", e))?;
+
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| format!("Decryption failed: {}", e))
+}
+
+/// Resolve the channel's encryption key from the secrets store.
+///
+/// Looks up `{channel_name}_pickle_key` and parses the 64-char hex string to 32 bytes.
+async fn resolve_channel_encryption_key(
+    secrets: Option<&(dyn SecretsStore + Send + Sync)>,
+    channel_name: &str,
+    owner_scope_id: &str,
+) -> Option<[u8; 32]> {
+    let secrets = secrets?;
+    let secret_name = format!("{}_pickle_key", channel_name);
+    let decrypted = secrets
+        .get_decrypted(owner_scope_id, &secret_name)
+        .await
+        .ok()?;
+    let hex_str = decrypted.expose().to_string();
+    if hex_str.len() != 64 {
+        tracing::warn!(
+            channel = %channel_name,
+            len = hex_str.len(),
+            "Encryption key has wrong length (expected 64 hex chars)"
+        );
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for i in 0..32 {
+        key[i] = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(key)
 }
 
 // Implement the generated Host trait for channel-host interface
@@ -560,6 +632,22 @@ impl near::agent::channel_host::Host for ChannelStoreData {
         self.host_state.secret_exists(&name)
     }
 
+    fn secure_encrypt(&mut self, plaintext: Vec<u8>) -> Result<Vec<u8>, String> {
+        let key = self
+            .encryption_key
+            .as_ref()
+            .ok_or("No encryption key configured for this channel")?;
+        host_secure_encrypt(key, &plaintext)
+    }
+
+    fn secure_decrypt(&mut self, ciphertext: Vec<u8>) -> Result<Vec<u8>, String> {
+        let key = self
+            .encryption_key
+            .as_ref()
+            .ok_or("No encryption key configured for this channel")?;
+        host_secure_decrypt(key, &ciphertext)
+    }
+
     fn emit_message(&mut self, msg: near::agent::channel_host::EmittedMessage) {
         tracing::info!(
             user_id = %msg.user_id,
@@ -707,7 +795,6 @@ impl near::agent::channel_host::Host for ChannelStoreData {
 }
 
 /// A WASM-based channel implementing the Channel trait.
-#[allow(dead_code)]
 pub struct WasmChannel {
     /// Channel name.
     name: String,
@@ -873,8 +960,26 @@ fn apply_emitted_metadata(mut msg: IncomingMessage, metadata_json: &str) -> Inco
     msg
 }
 
+/// Forward guest log entries to host tracing.
+fn forward_guest_logs(host_state: &mut ChannelHostState, channel_name: &str) {
+    for entry in host_state.take_logs() {
+        match entry.level {
+            crate::tools::wasm::LogLevel::Error => {
+                tracing::error!(channel = %channel_name, "{}", entry.message);
+            }
+            crate::tools::wasm::LogLevel::Warn => {
+                tracing::warn!(channel = %channel_name, "{}", entry.message);
+            }
+            _ => {
+                tracing::debug!(channel = %channel_name, "{}", entry.message);
+            }
+        }
+    }
+}
+
 impl WasmChannel {
     /// Create a new WASM channel.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         runtime: Arc<WasmChannelRuntime>,
         prepared: Arc<PreparedChannelModule>,
@@ -883,9 +988,12 @@ impl WasmChannel {
         config_json: String,
         pairing_store: Arc<PairingStore>,
         settings_store: Option<Arc<dyn crate::db::SettingsStore>>,
+        database: Option<Arc<dyn crate::db::Database>>,
     ) -> Self {
         let name = prepared.name.clone();
         let rate_limiter = ChannelEmitRateLimiter::new(capabilities.emit_rate_limit.clone());
+        let workspace_store =
+            Arc::new(Self::create_workspace_store(&capabilities, database.as_ref()));
 
         Self {
             name,
@@ -905,13 +1013,54 @@ impl WasmChannel {
             credentials: Arc::new(RwLock::new(HashMap::new())),
             typing_task: RwLock::new(None),
             pairing_store,
-            workspace_store: Arc::new(ChannelWorkspaceStore::new()),
+            workspace_store,
             last_broadcast_metadata: Arc::new(tokio::sync::RwLock::new(None)),
             settings_store,
             owner_scope_id: owner_scope_id.into(),
             owner_actor_id: None,
             secrets_store: None,
         }
+    }
+
+    /// Create a workspace store, using database or disk persistence.
+    fn create_workspace_store(
+        capabilities: &ChannelCapabilities,
+        database: Option<&Arc<dyn crate::db::Database>>,
+    ) -> ChannelWorkspaceStore {
+        if capabilities.workspace_prefix.is_empty() {
+            return ChannelWorkspaceStore::new();
+        }
+
+        // Extract channel_id from workspace_prefix (e.g., "channels/matrix/" -> "matrix")
+        let channel_id = capabilities
+            .workspace_prefix
+            .trim_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Prefer database backend when available
+        if let Some(db) = database {
+            tracing::debug!(
+                channel_id = %channel_id,
+                "Creating database-backed channel workspace store"
+            );
+            return ChannelWorkspaceStore::with_db(
+                channel_id,
+                Arc::clone(db) as Arc<dyn crate::db::ChannelWorkspaceDbStore>,
+            );
+        }
+
+        // Fall back to disk
+        let base = crate::bootstrap::ironclaw_base_dir()
+            .join("workspace")
+            .join(&capabilities.workspace_prefix);
+        tracing::debug!(
+            dir = %base.display(),
+            "Creating disk-backed channel workspace store"
+        );
+        ChannelWorkspaceStore::with_disk(base)
     }
 
     /// Set the secrets store for host-based credential injection.
@@ -967,7 +1116,7 @@ impl WasmChannel {
         // Serialize back
         *config_guard = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
-        tracing::debug!(
+        tracing::trace!(
             channel = %self.name,
             config = %*config_guard,
             "Updated channel config"
@@ -1096,6 +1245,14 @@ impl WasmChannel {
     /// Get the channel capabilities.
     pub fn capabilities(&self) -> &ChannelCapabilities {
         &self.capabilities
+    }
+
+    /// Get a mutable reference to the channel capabilities.
+    ///
+    /// Only available before the channel is wrapped in `Arc`. Used during
+    /// setup to resolve placeholder values (e.g., homeserver host).
+    pub fn capabilities_mut(&mut self) -> &mut ChannelCapabilities {
+        &mut self.capabilities
     }
 
     /// Get the registered endpoints.
@@ -1374,6 +1531,7 @@ impl WasmChannel {
         credentials: HashMap<String, String>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        encryption_key: Option<[u8; 32]>,
     ) -> Result<Store<ChannelStoreData>, WasmChannelError> {
         let engine = runtime.engine();
         let limits = &prepared.limits;
@@ -1386,6 +1544,7 @@ impl WasmChannel {
             credentials,
             host_credentials,
             pairing_store,
+            encryption_key,
         );
         let mut store = Store::new(engine, store_data);
 
@@ -1478,19 +1637,7 @@ impl WasmChannel {
     }
 
     fn log_on_start_host_state(&self, host_state: &mut ChannelHostState) {
-        for entry in host_state.take_logs() {
-            match entry.level {
-                crate::tools::wasm::LogLevel::Error => {
-                    tracing::error!(channel = %self.name, "{}", entry.message);
-                }
-                crate::tools::wasm::LogLevel::Warn => {
-                    tracing::warn!(channel = %self.name, "{}", entry.message);
-                }
-                _ => {
-                    tracing::debug!(channel = %self.name, "{}", entry.message);
-                }
-            }
-        }
+        forward_guest_logs(host_state, &self.name);
     }
 
     async fn execute_on_start_with_state(
@@ -1509,6 +1656,12 @@ impl WasmChannel {
             &self.owner_scope_id,
         )
         .await;
+        let encryption_key = resolve_channel_encryption_key(
+            self.secrets_store.as_deref(),
+            &self.name,
+            &self.owner_scope_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
         let workspace_store = self.workspace_store.clone();
 
@@ -1521,6 +1674,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    encryption_key,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1652,6 +1806,12 @@ impl WasmChannel {
             &self.owner_scope_id,
         )
         .await;
+        let encryption_key = resolve_channel_encryption_key(
+            self.secrets_store.as_deref(),
+            &self.name,
+            &self.owner_scope_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
         let workspace_store = self.workspace_store.clone();
 
@@ -1674,6 +1834,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    encryption_key,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1714,7 +1875,8 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         match result {
             Ok(Ok((response, mut host_state))) => {
-                // Process emitted messages
+                forward_guest_logs(&mut host_state, &channel_name);
+
                 let emitted = host_state.take_emitted_messages();
                 self.process_emitted_messages(emitted).await?;
 
@@ -1758,6 +1920,12 @@ impl WasmChannel {
             &self.owner_scope_id,
         )
         .await;
+        let encryption_key = resolve_channel_encryption_key(
+            self.secrets_store.as_deref(),
+            &self.name,
+            &self.owner_scope_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
         let workspace_store = self.workspace_store.clone();
 
@@ -1771,6 +1939,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    encryption_key,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1870,6 +2039,12 @@ impl WasmChannel {
             &self.owner_scope_id,
         )
         .await;
+        let encryption_key = resolve_channel_encryption_key(
+            self.secrets_store.as_deref(),
+            &self.name,
+            &self.owner_scope_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
         let workspace_store = self.workspace_store.clone();
 
@@ -1901,6 +2076,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    encryption_key,
                 )?;
 
                 tracing::info!("Instantiating WASM component for on_respond");
@@ -1944,8 +2120,12 @@ impl WasmChannel {
 
                 let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                // Commit pending workspace writes to the persistent store.
+                // Without this, writes from E2EE operations (Megolm/Olm session
+                // saves) would be lost after the callback returns.
                 let pending_writes = host_state.take_pending_writes();
                 workspace_store.commit_writes(&pending_writes);
+
                 tracing::info!("on_respond WASM execution completed successfully");
                 Ok(((), host_state))
             })
@@ -1962,7 +2142,9 @@ impl WasmChannel {
 
         let channel_name = self.name.clone();
         match result {
-            Ok(Ok(((), _host_state))) => {
+            Ok(Ok(((), mut host_state))) => {
+                forward_guest_logs(&mut host_state, &channel_name);
+
                 tracing::debug!(
                     channel = %channel_name,
                     message_id = %message_id,
@@ -2017,6 +2199,12 @@ impl WasmChannel {
             &self.owner_scope_id,
         )
         .await;
+        let encryption_key = resolve_channel_encryption_key(
+            self.secrets_store.as_deref(),
+            &self.name,
+            &self.owner_scope_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
         let workspace_store = self.workspace_store.clone();
 
@@ -2042,6 +2230,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    encryption_key,
                 )?;
 
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
@@ -2072,8 +2261,10 @@ impl WasmChannel {
 
                 let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                // Commit pending workspace writes to the persistent store.
                 let pending_writes = host_state.take_pending_writes();
                 workspace_store.commit_writes(&pending_writes);
+
                 tracing::info!("on_broadcast WASM execution completed successfully");
                 Ok(((), host_state))
             })
@@ -2087,7 +2278,9 @@ impl WasmChannel {
 
         let channel_name = self.name.clone();
         match result {
-            Ok(Ok(((), _host_state))) => {
+            Ok(Ok(((), mut host_state))) => {
+                forward_guest_logs(&mut host_state, &channel_name);
+
                 tracing::debug!(
                     channel = %channel_name,
                     "WASM channel on_broadcast completed"
@@ -2127,6 +2320,12 @@ impl WasmChannel {
             &self.owner_scope_id,
         )
         .await;
+        let encryption_key = resolve_channel_encryption_key(
+            self.secrets_store.as_deref(),
+            &self.name,
+            &self.owner_scope_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
         let workspace_store = self.workspace_store.clone();
 
@@ -2143,6 +2342,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    encryption_key,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -2195,6 +2395,7 @@ impl WasmChannel {
         credentials: &RwLock<HashMap<String, String>>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        encryption_key: Option<[u8; 32]>,
         timeout: Duration,
         workspace_store: &Arc<ChannelWorkspaceStore>,
         wit_update: wit_channel::StatusUpdate,
@@ -2219,6 +2420,7 @@ impl WasmChannel {
                     credentials_snapshot,
                     host_credentials,
                     pairing_store,
+                    encryption_key,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -2313,6 +2515,12 @@ impl WasmChannel {
                     &self.owner_scope_id,
                 )
                 .await;
+                let repeater_encryption_key = resolve_channel_encryption_key(
+                    self.secrets_store.as_deref(),
+                    &self.name,
+                    &self.owner_scope_id,
+                )
+                .await;
                 let pairing_store = self.pairing_store.clone();
                 let callback_timeout = self.runtime.config().callback_timeout;
                 let Some(wit_update) = status_to_wit(&status, metadata) else {
@@ -2338,6 +2546,7 @@ impl WasmChannel {
                             &credentials,
                             hc,
                             pairing_store.clone(),
+                            repeater_encryption_key,
                             callback_timeout,
                             &workspace_store,
                             wit_update_clone,
@@ -2607,10 +2816,16 @@ impl WasmChannel {
                             "Polling tick - calling on_poll"
                         );
 
-                        // Pre-resolve host credentials for this tick
+                        // Pre-resolve host credentials and encryption key for this tick
                         let host_credentials = resolve_channel_host_credentials(
                             &poll_capabilities,
                             poll_secrets_store.as_deref(),
+                            &owner_scope_id,
+                        )
+                        .await;
+                        let encryption_key = resolve_channel_encryption_key(
+                            poll_secrets_store.as_deref(),
+                            &channel_name,
                             &owner_scope_id,
                         )
                         .await;
@@ -2624,6 +2839,7 @@ impl WasmChannel {
                             &credentials,
                             host_credentials,
                             pairing_store.clone(),
+                            encryption_key,
                             callback_timeout,
                             &workspace_store,
                         ).await;
@@ -2686,6 +2902,7 @@ impl WasmChannel {
         credentials: &RwLock<HashMap<String, String>>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        encryption_key: Option<[u8; 32]>,
         timeout: Duration,
         workspace_store: &Arc<ChannelWorkspaceStore>,
     ) -> Result<Vec<EmittedMessage>, WasmChannelError> {
@@ -2715,6 +2932,7 @@ impl WasmChannel {
                     credentials_snapshot,
                     host_credentials,
                     pairing_store,
+                    encryption_key,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -2744,6 +2962,7 @@ impl WasmChannel {
         match result {
             Ok(Ok(mut host_state)) => {
                 let _ = drain_guest_logs(channel_name, "on_poll", &mut host_state);
+
                 let emitted = host_state.take_emitted_messages();
                 tracing::debug!(
                     channel = %channel_name,
@@ -4345,6 +4564,7 @@ mod tests {
             "{}".to_string(),
             Arc::new(PairingStore::new_noop()),
             None,
+            None,
         )
     }
 
@@ -4730,6 +4950,7 @@ mod tests {
             &credentials,
             Vec::new(), // no host credentials in test
             Arc::new(PairingStore::new_noop()),
+            None, // no encryption key in test
             timeout,
             &workspace_store,
         )
@@ -4889,6 +5110,7 @@ mod tests {
             "default",
             "{}".to_string(),
             Arc::new(PairingStore::new_noop()),
+            None,
             None,
         );
 
@@ -5673,6 +5895,7 @@ mod tests {
             creds,
             Vec::new(),
             Arc::new(PairingStore::new_noop()),
+            None,
         );
 
         let error = format!(
@@ -5707,6 +5930,7 @@ mod tests {
             std::collections::HashMap::new(),
             Vec::new(),
             Arc::new(PairingStore::new_noop()),
+            None,
         );
 
         let input = "some error message";
@@ -5738,6 +5962,7 @@ mod tests {
             creds,
             host_creds,
             Arc::new(PairingStore::new_noop()),
+            None,
         );
 
         // Error containing URL-encoded form of the credential
@@ -5771,6 +5996,7 @@ mod tests {
             creds,
             Vec::new(),
             Arc::new(PairingStore::new_noop()),
+            None,
         );
 
         let input = "should not match anything";

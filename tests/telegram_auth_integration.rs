@@ -162,6 +162,7 @@ async fn create_telegram_channel_with_store(
         config_json.to_string(),
         pairing_store,
         None,
+        None,
     );
     channel
         .set_credential("TELEGRAM_BOT_TOKEN", "123456:ABCDEF".to_string())
