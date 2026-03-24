@@ -1174,6 +1174,29 @@ pub trait IdentityStore: Send + Sync {
     ) -> Result<(), DatabaseError>;
 }
 
+/// Channel workspace key-value storage.
+///
+/// Provides persistent storage for WASM channels (e.g., Matrix E2EE state,
+/// sync tokens, user preferences). Scoped by channel_id to prevent collisions.
+#[async_trait]
+pub trait ChannelWorkspaceDbStore: Send + Sync {
+    /// Read a value from channel workspace storage.
+    async fn channel_workspace_read(
+        &self,
+        channel_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, DatabaseError>;
+
+    /// Write a value to channel workspace storage (upsert).
+    async fn channel_workspace_write(
+        &self,
+        channel_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), DatabaseError>;
+
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -1190,6 +1213,7 @@ pub trait Database:
     + UserStore
     + ChannelPairingStore
     + IdentityStore
+    + ChannelWorkspaceDbStore
     + Send
     + Sync
 {

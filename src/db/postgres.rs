@@ -16,9 +16,9 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    ApiTokenRecord, ChannelPairingStore, ConversationStore, Database, IdentityStore, JobStore,
-    PairingRequestRecord, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore,
-    UserIdentityRecord, UserRecord, UserStore, WorkspaceStore,
+    ApiTokenRecord, ChannelPairingStore, ChannelWorkspaceDbStore, ConversationStore, Database,
+    IdentityStore, JobStore, PairingRequestRecord, RoutineStore, SandboxStore, SettingsStore,
+    ToolFailureStore, UserIdentityRecord, UserRecord, UserStore, WorkspaceStore,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -1534,4 +1534,51 @@ impl IdentityStore for PgBackend {
         tx.commit().await?;
         Ok(())
     }
+}
+
+// ==================== ChannelWorkspaceDbStore ====================
+
+#[async_trait]
+impl ChannelWorkspaceDbStore for PgBackend {
+    async fn channel_workspace_read(
+        &self,
+        channel_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, DatabaseError> {
+        let client = self.pool().get().await.map_err(|e| {
+            DatabaseError::Pool(format!("pool error: {e}"))
+        })?;
+        let row = client
+            .query_opt(
+                "SELECT value FROM channel_workspace WHERE channel_id = $1 AND key = $2",
+                &[&channel_id, &key],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    async fn channel_workspace_write(
+        &self,
+        channel_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), DatabaseError> {
+        let client = self.pool().get().await.map_err(|e| {
+            DatabaseError::Pool(format!("pool error: {e}"))
+        })?;
+        client
+            .execute(
+                "INSERT INTO channel_workspace (channel_id, key, value, updated_at)
+                 VALUES ($1, $2, $3, NOW())
+                 ON CONFLICT (channel_id, key) DO UPDATE SET
+                     value = EXCLUDED.value,
+                     updated_at = NOW()",
+                &[&channel_id, &key, &value],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
+
 }

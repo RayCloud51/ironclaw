@@ -674,6 +674,16 @@ CREATE TABLE IF NOT EXISTS pairing_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_pairing_requests_channel ON pairing_requests (channel, external_id);
 
+-- ==================== Channel workspace ====================
+
+CREATE TABLE IF NOT EXISTS channel_workspace (
+    channel_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (channel_id, key)
+);
+
 "#;
 
 /// Incremental migrations applied after the base schema.
@@ -983,6 +993,19 @@ WHERE source_channel IS NULL;
         // includes this column for fresh installs.
         r#"
 ALTER TABLE agent_jobs ADD COLUMN restart_params TEXT;
+"#,
+    ),
+    (
+        23,
+        "channel_workspace",
+        r#"
+CREATE TABLE IF NOT EXISTS channel_workspace (
+    channel_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (channel_id, key)
+);
 "#,
     ),
 ];
