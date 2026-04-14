@@ -131,6 +131,7 @@ async fn create_slack_channel_with_store(
         config_json.to_string(),
         pairing_store,
         None,
+        None,
     );
     channel
         .set_credential("SLACK_BOT_TOKEN", "xoxb-fake-test-token".to_string())
