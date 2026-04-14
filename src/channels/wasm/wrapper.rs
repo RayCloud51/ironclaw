@@ -3705,6 +3705,13 @@ fn spawn_websocket_poll(poll_guard: tokio::sync::OwnedMutexGuard<()>, ctx: Webso
             )
             .await;
 
+            let encryption_key = resolve_channel_encryption_key(
+                ctx.secrets_store.as_deref(),
+                &ctx.channel_name,
+                &ctx.owner_scope_id,
+            )
+            .await;
+
             match WasmChannel::execute_poll(
                 &ctx.channel_name,
                 &ctx.runtime,
@@ -3713,6 +3720,7 @@ fn spawn_websocket_poll(poll_guard: tokio::sync::OwnedMutexGuard<()>, ctx: Webso
                 &ctx.credentials,
                 host_credentials,
                 ctx.pairing_store.clone(),
+                encryption_key,
                 ctx.callback_timeout,
                 &ctx.workspace_store,
             )
@@ -6172,6 +6180,7 @@ mod tests {
             std::collections::HashMap::new(),
             Vec::new(),
             Arc::new(PairingStore::new_noop()),
+            None,
         );
 
         let result = super::near::agent::channel_host::Host::http_request(
@@ -6213,6 +6222,7 @@ mod tests {
             std::collections::HashMap::new(),
             Vec::new(),
             Arc::new(PairingStore::new_noop()),
+            None,
         );
 
         let result = super::near::agent::channel_host::Host::http_request(
