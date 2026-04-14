@@ -662,6 +662,16 @@ impl Agent {
                 let (response, suggestions) =
                     crate::agent::dispatcher::extract_suggestions(&response);
 
+                // If the response is empty after suggestion extraction but the
+                // turn had tool calls with a plain-string result, use the last
+                // one. This handles models that emit the user-facing text via a
+                // tool call and then return only suggestions in the final turn.
+                let response = if response.is_empty() {
+                    last_tool_string_result(thread).unwrap_or(response)
+                } else {
+                    response
+                };
+
                 // Hook: TransformResponse — allow hooks to modify or reject the final response
                 let response = {
                     let event = crate::hooks::HookEvent::ResponseTransform {
@@ -1746,6 +1756,11 @@ impl Agent {
                 }) => {
                     let (response, suggestions) =
                         crate::agent::dispatcher::extract_suggestions(&response);
+                    let response = if response.is_empty() {
+                        last_tool_string_result(thread).unwrap_or(response)
+                    } else {
+                        response
+                    };
                     thread.complete_turn(&response);
                     let (turn_number, tool_calls, narrative) = thread
                         .turns
@@ -2334,6 +2349,19 @@ fn rebuild_chat_messages_from_db(
     }
 
     result
+}
+
+/// Return the last successful tool call result that is a plain string.
+///
+/// Used as a fallback when the LLM's final text response is empty (e.g. only
+/// `<suggestions>` tags) but the turn produced user-facing output via a tool.
+fn last_tool_string_result(thread: &crate::agent::session::Thread) -> Option<String> {
+    thread.turns.last().and_then(|t| {
+        t.tool_calls
+            .iter()
+            .rev()
+            .find_map(|tc| tc.result.as_ref().and_then(|r| r.as_str()).map(String::from))
+    })
 }
 
 #[cfg(test)]
